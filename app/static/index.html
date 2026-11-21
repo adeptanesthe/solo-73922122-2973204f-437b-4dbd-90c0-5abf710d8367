@@ -71,6 +71,7 @@
     同一 float64 权重 W（种子 → 标准正态 × 倍率）既作输入嵌入又作输出投影；按全部有效 token
     （目标 -100 忽略）的平均交叉熵，以 lr=0.01 做一次 SGD。自定义 autograd 损失的分块投影临时张量
     词表轴不超过 128，且前向不保存任何分块分数/概率；右侧与独立稠密参考逐项比对。
+    目标概率接近 1 时，两条路径都用非目标质量公式保留仍可表示的微小损失与梯度。
   </div>
 </header>
 <main>
@@ -124,7 +125,9 @@
           <thead><tr><th>对照项</th><th style="text-align:right">|差值|</th><th>判定</th></tr></thead>
           <tbody id="checks"></tbody>
         </table>
-        <div class="hint">对照：自定义分块实现 vs 独立稠密参考（整体前向/反向，无分块限制）。</div>
+        <div class="hint">对照：自定义分块实现 vs 独立稠密参考（整体前向/反向，无分块限制）。
+          当参考损失与参考梯度的量级都落入 1e-100…1e-12 时，损失与梯度还需满足相对误差 ≤1e-6，
+          以免仍可表示的小概率被舍入成 0 后误判为通过。</div>
       </div>
       <div class="card">
         <h2>微批拆分不变量</h2>
@@ -259,6 +262,21 @@ function render(report) {
     <tr><td>${label}</td>
         <td class="num">${fmt(value)}</td>
         <td class="${pass ? "ok" : "bad"}">${pass ? "✓ ≤1e-8" : "✗ >1e-8"}</td></tr>`).join("");
+
+  const rel = report.relative_check;
+  if (rel && rel.applies) {
+    const relRows = [
+      ["损失相对误差（/ 参考量级）", rel.loss_relative_diff, rel.loss_pass],
+      ["梯度相对误差（/ 参考量级）", rel.grad_relative_diff, rel.grad_pass],
+    ];
+    $("checks").innerHTML += relRows.map(([label, value, pass]) => `
+      <tr><td>${label}</td>
+          <td class="num">${fmt(value)}</td>
+          <td class="${pass ? "ok" : "bad"}">${pass ? "✓ ≤1e-6" : "✗ >1e-6"}</td></tr>`).join("") +
+      `<tr><td colspan="3" class="hint">参考量级：损失 ${fmt(rel.reference_loss_magnitude)}，
+        梯度 ${fmt(rel.reference_grad_magnitude)}（均落在 ${fmt(rel.reference_min)}…${fmt(rel.reference_max)}，
+        已启用相对阈值 ${fmt(rel.tolerance)}）</td></tr>`;
+  }
 
   $("splits").innerHTML = report.split.runs.map((r) => `
     <tr><td>${r.microbatches} 个微批（有效 ${r.valid_tokens}/${r.token_count}）</td>

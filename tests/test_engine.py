@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import sys
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from app.engine import (  # noqa: E402
     TOLERANCE,
     ChunkedSoftmaxLoss,
     ValidationError,
+    dense_reference,
     evaluate,
     make_weight,
     parse_payload,
@@ -157,6 +159,142 @@ def test_large_scores_remain_accurate(scale):
     assert report["ok"], report["errors"]
     for key in ("loss_abs_diff", "grad_max_abs_diff", "weight_max_abs_diff"):
         assert report["errors"][key] <= TOLERANCE
+
+
+TINY_REFERENCE_CASE = {
+    "seed": 0,
+    "scale": 2,
+    "vocab_size": 257,
+    "microbatches": [{"name": "tiny", "tokens": [[256, 256]]}],
+}
+
+# Independent 60-digit ground truth for TINY_REFERENCE_CASE: mean cross
+# entropy = -log p_{256} and the largest tied-weight gradient component
+# (output projection plus input embedding roles), computed with decimal.
+TINY_REFERENCE_LOSS = Decimal("2.886112181723477210042242e-26")
+TINY_REFERENCE_GRAD_MAX = Decimal("2.574949650176200399077408e-25")
+
+
+def _hp_ground_truth(payload, prec=60):
+    """High-precision loss and tied-W gradient for one micro-batch spec."""
+    with localcontext() as ctx:
+        ctx.prec = prec
+        spec = parse_payload(payload)
+        w = make_weight(spec.vocab_size, spec.seed, spec.scale).tolist()
+        inputs, targets = [], []
+        for mb in spec.microbatches:
+            inputs.extend(mb.input_ids)
+            targets.extend(mb.target_ids)
+        W = [[Decimal(repr(x)) for x in row] for row in w]
+        grad = [[Decimal(0)] * 16 for _ in range(spec.vocab_size)]
+        terms = []
+        for inp, tgt in zip(inputs, targets):
+            if tgt == IGNORE_INDEX:
+                continue
+            h = [Decimal(repr(x)) for x in w[inp]]
+            z = [sum(h[d] * W[v][d] for d in range(16)) for v in range(spec.vocab_size)]
+            m = max(z)
+            ex = [(zv - m).exp() for zv in z]
+            total = sum(ex)
+            probs = [x / total for x in ex]
+            terms.append(-probs[tgt].ln())
+            for v in range(spec.vocab_size):
+                g = probs[v] - (1 if v == tgt else 0)
+                if g == 0:
+                    continue
+                for d in range(16):
+                    grad[v][d] += g * h[d]       # output-projection role
+                    grad[inp][d] += g * W[v][d]  # input-embedding role
+        n = len(terms)
+        return (
+            sum(terms) / n,
+            [[x / n for x in row] for row in grad],
+        )
+
+
+def test_near_one_target_keeps_tiny_loss_and_gradient():
+    """seed=0, vocab=257, scale=2, pair (256, 256): p_target rounds to 1.
+
+    The true mean cross entropy is ~2.9e-26 (still representable in float64);
+    ``lse - target_logit`` and ``p_t - 1`` both round to exactly 0, which used
+    to report loss 0 and an all-zero shared-weight gradient.  Both the chunked
+    and the dense reference path must recover the tiny values.
+    """
+    report = evaluate(TINY_REFERENCE_CASE)
+    ref_loss = report["dense"]["loss"]
+    assert report["ok"], (report["errors"], report["checks"])
+    assert 0.0 < ref_loss < 1e-20
+    assert report["dense"]["grad_norm"] > 0.0
+    assert report["chunked"]["grad_norm"] > 0.0
+    assert report["chunked"]["loss"] > 0.0
+    assert report["errors"]["loss_abs_diff"] < 1e-8
+    assert report["errors"]["grad_max_abs_diff"] < 1e-8
+
+    spec = parse_payload(TINY_REFERENCE_CASE)
+    res = run_chunked(spec)
+    assert float(res.grad.abs().max()) > 0.0
+    assert res.loss > 0.0
+
+    relative = report["relative_check"]
+    assert relative["applies"] is True
+    assert relative["loss_relative_diff"] <= 1e-6
+    assert relative["grad_relative_diff"] <= 1e-6
+    assert relative["loss_pass"] and relative["grad_pass"]
+
+    # Independent high-precision check: both implementations must agree with
+    # the 60-digit ground truth to ~float64 precision, not merely be non-zero.
+    true_loss, true_grad = _hp_ground_truth(TINY_REFERENCE_CASE)
+    true_max = max(abs(x) for row in true_grad for x in row)
+    assert abs(TINY_REFERENCE_LOSS - true_loss) / true_loss < Decimal("1e-10")
+    assert abs(TINY_REFERENCE_GRAD_MAX - true_max) / true_max < Decimal("1e-10")
+
+    _, dense_grad = dense_reference(make_weight(257, 0, 2.0), [256], [256])
+    for label, got in (("chunked", res.grad), ("dense", dense_grad)):
+        got_max = Decimal(repr(float(got.abs().max())))
+        assert abs(got_max - true_max) / true_max < Decimal("1e-10"), label
+        err = max(
+            abs(Decimal(repr(float(got[v, d]))) - true_grad[v][d])
+            for v in range(got.shape[0])
+            for d in range(got.shape[1])
+        )
+        assert err / true_max < Decimal("1e-10"), label
+
+
+def test_near_one_target_survives_microbatch_splitting():
+    payload = dict(TINY_REFERENCE_CASE)
+    payload["microbatches"] = [
+        {"name": "a", "tokens": [[256, 256]]},
+        {"name": "b", "tokens": [[256, 256]]},
+    ]
+    report = evaluate(payload)
+    assert report["ok"], (report["errors"], report["split"])
+    assert report["relative_check"]["applies"] is True
+    assert report["split"]["max_grad_diff"] <= TOLERANCE
+    assert report["split"]["max_loss_diff"] <= TOLERANCE
+
+
+def test_relative_gate_rejects_zeroed_tiny_reference(monkeypatch):
+    """A loss rounded to zero must fail the tiny-reference gate.
+
+    Regression guard: the absolute 1e-8 tolerance alone would accept 0 as a
+    correct value for a ~2.9e-26 true loss.
+    """
+    import app.engine as engine
+
+    original = engine._row_margins
+
+    def rounded(hidden, target, weight, top):
+        return torch.zeros_like(original(hidden, target, weight, top))
+
+    monkeypatch.setattr(engine, "_row_margins", rounded)
+    report = evaluate(TINY_REFERENCE_CASE)
+    assert report["relative_check"]["applies"] is True
+    # Loss is now exactly 0 while the dense reference is ~2.9e-26, so the
+    # relative gate must flag it even though the absolute diff is < 1e-8.
+    assert report["errors"]["loss_abs_diff"] <= TOLERANCE
+    assert not report["checks"]["loss"]
+    assert report["relative_check"]["loss_relative_diff"] > 1e-6
+    assert report["ok"] is False
 
 
 def test_duplicate_inputs_accumulate_gradients():

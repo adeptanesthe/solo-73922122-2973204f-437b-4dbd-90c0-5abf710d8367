@@ -14,7 +14,13 @@ Design contract
   the target ids and the valid-row indices (plus the shared parameter itself)
   cross the forward/backward boundary.  Everything chunk-wise is recomputed.
 * An independent dense reference (full ``[tokens, vocab]`` logits, no limits)
-  provides the ground truth for loss, gradient and post-update weights.
+  provides the ground truth for loss, gradient and post-update weights.  It
+  also evaluates the per-row loss from the *non-target* mass
+  (``softplus(lse_others - z_t)``) so a near-certain target's tiny cross
+  entropy is not rounded away.
+* When both reference magnitudes (loss and largest gradient component) fall in
+  [1e-100, 1e-12], the absolute 1e-8 check is joined by a relative check: the
+  error must be <= 1e-6 of the reference magnitude.
 * Mini-batch splitting is mathematically neutral; the engine verifies it
   empirically for splits into 1..4 micro-batches.
 """
@@ -40,6 +46,17 @@ LEARNING_RATE = 0.01
 MIN_SCALE = 0.1
 MAX_SCALE = 100.0
 TOLERANCE = 1e-8
+# When the reference magnitude itself is tiny, an absolute tolerance cannot
+# tell a correct tiny quantity from a rounded-to-zero one.  For reference
+# magnitudes in this window the reported error must additionally stay within
+# RELATIVE_TOLERANCE of the reference magnitude.
+RELATIVE_TOLERANCE = 1e-6
+RELATIVE_REFERENCE_MIN = 1e-100
+RELATIVE_REFERENCE_MAX = 1e-12
+# A per-token ``z_t - max`` above -1e-3 means the target owns almost all the
+# mass, where ``lse - target_logit`` can lose the (still representable) cross
+# entropy to cancellation.  Those rows use the ``log1p`` non-target-mass form.
+TINY_MASS_LOG_THRESHOLD = 1e-3
 MAX_SEED = 2**63 - 1
 
 
@@ -204,14 +221,14 @@ def _chunk_ranges(vocab_size: int) -> Iterable[Tuple[int, int]]:
 # ---------------------------------------------------------------------------
 # Chunked numerics helpers (all temps have a vocab axis <= 128)
 # ---------------------------------------------------------------------------
-def _token_logsumexp(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Per-token log-sum-exp over the full vocabulary, chunk by chunk."""
-    lse = torch.full((hidden.shape[0],), -math.inf, dtype=torch.float64)
+def _token_max(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Per-token maximum score over the full vocabulary, chunk by chunk."""
+    top = torch.full((hidden.shape[0],), -math.inf, dtype=torch.float64)
     for start, end in _chunk_ranges(weight.shape[0]):
         logits = hidden @ weight[start:end].t()  # [N, <=128]
-        lse = torch.logaddexp(lse, torch.logsumexp(logits, dim=1))
+        top = torch.maximum(top, logits.max(dim=1).values)
         del logits
-    return lse
+    return top
 
 
 def _target_logits(
@@ -230,6 +247,44 @@ def _target_logits(
         picked[rows] = logits.gather(1, cols.unsqueeze(1)).squeeze(1)
         del logits
     return picked
+
+
+def _row_margins(
+    hidden: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    top: torch.Tensor,
+) -> torch.Tensor:
+    """``lse - target_logit`` per row, without a large-minus-large subtraction.
+
+    With ``s = z_t - m`` (``m`` the row maximum) and ``S = sum_{v != t}
+    exp(z_v - m)``, the cross entropy is exactly ``log1p(S * exp(-s))``.
+    Computing ``lse - z_t`` directly cancels to exactly 0 once the target is
+    the argmax and ``lse`` rounds up to ``z_t``, even though the true
+    ``-log p_t`` is still representable.  Rows with a comfortably negative
+    ``s`` use the equivalent plain form ``-s + log(exp(s) + S)``, where
+    ``exp(-s)`` could overflow and no cancellation can occur.
+    """
+    z_t = _target_logits(hidden, target, weight)
+    mass = torch.zeros(hidden.shape[0], dtype=torch.float64)
+    for start, end in _chunk_ranges(weight.shape[0]):
+        logits = hidden @ weight[start:end].t()  # [N, <=128]
+        sel = (target >= start) & (target < end)
+        shifted = torch.exp(logits - top.unsqueeze(1))
+        if bool(sel.any()):
+            picked_rows = torch.nonzero(sel, as_tuple=False).flatten()
+            cols = target.index_select(0, picked_rows) - start
+            shifted[picked_rows, cols] = 0.0  # exclude the target itself
+        mass += shifted.sum(dim=1)
+        del logits, shifted
+
+    log_shift = z_t - top  # <= 0, exactly 0 when the target is the argmax
+    margins = -log_shift + torch.log(torch.exp(log_shift) + mass)
+    near = log_shift > -TINY_MASS_LOG_THRESHOLD
+    # S excludes the target, so adding exp(s) (which rounds to 1 when the
+    # target dominates) cannot swallow the tiny non-target mass.
+    margins[near] = torch.log1p(mass[near] * torch.exp(-log_shift[near]))
+    return margins
 
 
 # Thread-local record of what each forward pass hands to save_for_backward, so
@@ -270,9 +325,8 @@ class ChunkedSoftmaxLoss(torch.autograd.Function):
         h = hidden.index_select(0, valid_idx)
         tgt = target.index_select(0, valid_idx)
 
-        lse = _token_logsumexp(h, weight)
-        target_logit = _target_logits(h, tgt, weight)
-        loss = (lse - target_logit).mean()
+        top = _token_max(h, weight)
+        loss = _row_margins(h, tgt, weight, top).mean()
 
         ctx.save_for_backward(weight, hidden, target, valid_idx)
         ctx.n_valid = n_valid
@@ -287,21 +341,47 @@ class ChunkedSoftmaxLoss(torch.autograd.Function):
         h = hidden.index_select(0, valid_idx)
         tgt = target.index_select(0, valid_idx)
 
-        # Recompute the global normaliser: nothing chunk-wise was cached.
-        lse = _token_logsumexp(h, weight)
+        # Recompute the shifted normaliser: nothing chunk-wise was cached.
+        # With m the row max, s = z_t - m and S = sum_{v != t} exp(z_v - m),
+        # the softmax is p_v = exp(z_v - m) / (exp(s) + S) and
+        # p_t - 1 = -S / (exp(s) + S).  Evaluating the target column from the
+        # (small) non-target mass keeps the gradient the shared weight needs
+        # even when p_t rounds to 1; the plain ``p_t - 1`` would round to 0.
+        top = _token_max(h, weight)
+        other_mass = torch.zeros(h.shape[0], dtype=torch.float64)
+        target_shift = torch.empty(h.shape[0], dtype=torch.float64)
+        for start, end in _chunk_ranges(weight.shape[0]):
+            logits = h @ weight[start:end].t()  # [N, <=128]
+            shifted = torch.exp(logits - top.unsqueeze(1))
+            sel = (tgt >= start) & (tgt < end)
+            if bool(sel.any()):
+                rows = torch.nonzero(sel, as_tuple=False).flatten()
+                cols = tgt.index_select(0, rows) - start
+                target_shift[rows] = (
+                    logits.index_select(0, rows)
+                    .gather(1, cols.unsqueeze(1))
+                    .squeeze(1)
+                    - top[rows]
+                )
+                shifted[rows, cols] = 0.0  # exclude the target from the mass
+            other_mass += shifted.sum(dim=1)
+            del logits, shifted
+
         scale = grad_output / n_valid
+        denom = torch.exp(target_shift) + other_mass  # exp(s) + S
+        target_prob = -other_mass / denom  # exactly p_t - 1
 
         grad_weight = torch.zeros_like(weight)
         grad_h = torch.zeros_like(h)
 
         for start, end in _chunk_ranges(weight.shape[0]):
             logits = h @ weight[start:end].t()  # [N, <=128]
-            probs = torch.exp(logits - lse.unsqueeze(1))
+            probs = torch.exp(logits - top.unsqueeze(1)) / denom.unsqueeze(1)
             sel = (tgt >= start) & (tgt < end)
             if bool(sel.any()):
                 rows = torch.nonzero(sel, as_tuple=False).flatten()
                 cols = tgt.index_select(0, rows) - start
-                probs[rows, cols] -= 1.0
+                probs[rows, cols] = target_prob[rows]
             probs.mul_(scale)
             grad_weight[start:end] += probs.t() @ h
             grad_h += probs @ weight[start:end]
@@ -322,6 +402,14 @@ def dense_reference(
     input_ids: Sequence[int],
     target_ids: Sequence[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dense reference: full ``[T, V]`` scores, no chunking.
+
+    The per-row loss is evaluated as ``softplus(lse_others - z_t)`` with
+    ``lse_others`` the log-sum-exp over *non-target* classes.  This is exactly
+    ``-log p_t`` but avoids the ``lse - z_t`` cancellation that rounds the
+    still-representable cross entropy of a near-certain target to 0, and it
+    also avoids a ``p_t - 1`` gradient that would round to 0.
+    """
     w = weight.detach().clone().requires_grad_(True)
     idx = torch.tensor(input_ids, dtype=torch.long)
     tgt = torch.tensor(target_ids, dtype=torch.long)
@@ -329,9 +417,16 @@ def dense_reference(
 
     hidden = w.index_select(0, idx)  # input embedding
     logits = hidden @ w.t()  # [T, V] full dense scores
-    log_probs = torch.log_softmax(logits, dim=1)
-    picked = log_probs.gather(1, tgt.clamp_min(0).unsqueeze(1)).squeeze(1)
-    loss = -picked[valid].mean()
+    tgt_safe = tgt.clamp_min(0)
+    target_logit = logits.gather(1, tgt_safe.unsqueeze(1)).squeeze(1)
+
+    is_target = torch.zeros_like(logits, dtype=torch.bool)
+    is_target.scatter_(1, tgt_safe.unsqueeze(1), True)
+    lse_others = torch.logsumexp(logits.masked_fill(is_target, -math.inf), dim=1)
+
+    # log1p(exp(lse_others - z_t)) computed by softplus, stable at both tails.
+    per_row = torch.nn.functional.softplus(lse_others - target_logit)
+    loss = per_row[valid].mean()
     loss.backward()
     return loss.detach(), w.grad.detach().clone()
 
@@ -459,6 +554,25 @@ def evaluate(payload: dict) -> dict:
     err_grad = _max_abs_diff(user.grad, ref_grad)
     err_weight = _max_abs_diff(user.updated_weight, ref_updated)
 
+    # Tiny-reference guard: when both the reference loss and the largest
+    # reference gradient component fall in [1e-100, 1e-12], an absolute 1e-8
+    # cannot distinguish a correct tiny value from one rounded to zero, so the
+    # error must also stay within 1e-6 of the reference magnitude.
+    ref_loss_scale = abs(float(ref_loss.item()))
+    ref_grad_scale = float(ref_grad.abs().max().item())
+    relative_applies = (
+        RELATIVE_REFERENCE_MIN <= ref_loss_scale <= RELATIVE_REFERENCE_MAX
+        and RELATIVE_REFERENCE_MIN <= ref_grad_scale <= RELATIVE_REFERENCE_MAX
+    )
+    rel_loss = err_loss / ref_loss_scale if relative_applies and ref_loss_scale > 0 else None
+    rel_grad = err_grad / ref_grad_scale if relative_applies and ref_grad_scale > 0 else None
+    loss_ok = err_loss <= TOLERANCE and (
+        rel_loss is None or rel_loss <= RELATIVE_TOLERANCE
+    )
+    grad_ok = err_grad <= TOLERANCE and (
+        rel_grad is None or rel_grad <= RELATIVE_TOLERANCE
+    )
+
     # Mini-batch splitting invariance: re-split the same token stream into
     # every micro-batch count from 1..min(4, tokens).
     split_runs = []
@@ -499,23 +613,30 @@ def evaluate(payload: dict) -> dict:
         )
 
     checks = {
-        "loss": err_loss <= TOLERANCE,
-        "grad": err_grad <= TOLERANCE,
+        "loss": loss_ok,
+        "grad": grad_ok,
         "updated_weight": err_weight <= TOLERANCE,
         "split_loss": max_split_loss <= TOLERANCE,
         "split_grad": max_split_grad <= TOLERANCE,
         "split_weight": max_split_weight <= TOLERANCE,
     }
     passed = all(checks.values())
+    if passed:
+        message = "通过：三项对照误差与拆分不变量均 <= 1e-8"
+        if relative_applies:
+            message += "（微小参考量级另需相对误差 <= 1e-6，已通过）"
+    else:
+        message = "未通过：至少一项误差超过 1e-8"
+        if relative_applies and (
+            (rel_loss is not None and rel_loss > RELATIVE_TOLERANCE)
+            or (rel_grad is not None and rel_grad > RELATIVE_TOLERANCE)
+        ):
+            message = "未通过：微小参考量级下的相对误差超过 1e-6"
 
     return {
         "ok": passed,
         "tolerance": TOLERANCE,
-        "message": (
-            "通过：三项对照误差与拆分不变量均 <= 1e-8"
-            if passed
-            else "未通过：至少一项误差超过 1e-8"
-        ),
+        "message": message,
         "config": {
             "vocab_size": spec.vocab_size,
             "embed_dim": EMBED_DIM,
@@ -540,6 +661,18 @@ def evaluate(payload: dict) -> dict:
             "loss_abs_diff": err_loss,
             "grad_max_abs_diff": err_grad,
             "weight_max_abs_diff": err_weight,
+        },
+        "relative_check": {
+            "applies": relative_applies,
+            "reference_min": RELATIVE_REFERENCE_MIN,
+            "reference_max": RELATIVE_REFERENCE_MAX,
+            "tolerance": RELATIVE_TOLERANCE,
+            "reference_loss_magnitude": ref_loss_scale,
+            "reference_grad_magnitude": ref_grad_scale,
+            "loss_relative_diff": rel_loss,
+            "grad_relative_diff": rel_grad,
+            "loss_pass": rel_loss is None or rel_loss <= RELATIVE_TOLERANCE,
+            "grad_pass": rel_grad is None or rel_grad <= RELATIVE_TOLERANCE,
         },
         "split": {
             "max_loss_diff": max_split_loss,
